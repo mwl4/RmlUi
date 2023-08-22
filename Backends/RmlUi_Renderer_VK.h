@@ -636,6 +636,7 @@ private:
 	VkSurfaceFormatKHR m_swapchain_format;
 	shader_vertex_user_data_t m_user_data_for_vertex_shader;
 	texture_data_t m_texture_depthstencil;
+	texture_data_t m_texture_color;
 
 	Rml::Matrix4f m_projection;
 	Rml::Vector<VkFence> m_executed_fences;
@@ -654,6 +655,8 @@ private:
 	MemoryPool m_memory_pool;
 	UploadResourceManager m_upload_manager;
 	DescriptorPoolManager m_manager_descriptors;
+
+	VkSampleCountFlagBits m_msaa_samples = VK_SAMPLE_COUNT_1_BIT;
 };
 
 #endif

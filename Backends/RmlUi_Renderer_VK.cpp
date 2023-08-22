@@ -50,6 +50,41 @@ VkValidationFeatureEnableEXT debug_validation_features_ext_requested[] = {
 	VK_VALIDATION_FEATURE_ENABLE_BEST_PRACTICES_EXT,
 };
 
+VkSampleCountFlagBits GetMaxUsableSampleCount(VkPhysicalDevice physicalDevice)
+{
+	VkPhysicalDeviceProperties physicalDeviceProperties;
+	vkGetPhysicalDeviceProperties(physicalDevice, &physicalDeviceProperties);
+
+	VkSampleCountFlags counts =
+		physicalDeviceProperties.limits.framebufferColorSampleCounts & physicalDeviceProperties.limits.framebufferDepthSampleCounts;
+	if (counts & VK_SAMPLE_COUNT_64_BIT)
+	{
+		return VK_SAMPLE_COUNT_64_BIT;
+	}
+	if (counts & VK_SAMPLE_COUNT_32_BIT)
+	{
+		return VK_SAMPLE_COUNT_32_BIT;
+	}
+	if (counts & VK_SAMPLE_COUNT_16_BIT)
+	{
+		return VK_SAMPLE_COUNT_16_BIT;
+	}
+	if (counts & VK_SAMPLE_COUNT_8_BIT)
+	{
+		return VK_SAMPLE_COUNT_8_BIT;
+	}
+	if (counts & VK_SAMPLE_COUNT_4_BIT)
+	{
+		return VK_SAMPLE_COUNT_4_BIT;
+	}
+	if (counts & VK_SAMPLE_COUNT_2_BIT)
+	{
+		return VK_SAMPLE_COUNT_2_BIT;
+	}
+
+	return VK_SAMPLE_COUNT_1_BIT;
+}
+
 #ifdef RMLUI_VK_DEBUG
 static Rml::String FormatByteSize(VkDeviceSize size) noexcept
 {
@@ -811,6 +846,8 @@ bool RenderInterface_VK::Initialize(Rml::Vector<const char*> required_extensions
 
 	VkPhysicalDeviceProperties physical_device_properties = {};
 	Initialize_PhysicalDevice(physical_device_properties);
+
+	m_msaa_samples = GetMaxUsableSampleCount(m_p_physical_device);
 
 	glad_result = gladLoaderLoadVulkan(m_p_instance, m_p_physical_device, VK_NULL_HANDLE);
 	RMLUI_VK_ASSERTMSG(glad_result != 0, "Vulkan loader failed - Instance functions");
@@ -2007,7 +2044,7 @@ void RenderInterface_VK::Create_Pipelines() noexcept
 	VkPipelineMultisampleStateCreateInfo info_multisample = {};
 	info_multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
 	info_multisample.pNext = nullptr;
-	info_multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+	info_multisample.rasterizationSamples = m_msaa_samples;
 	info_multisample.flags = 0;
 
 	Rml::Array<VkDynamicState, 2> dynamicStateEnables = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
@@ -2187,9 +2224,66 @@ void RenderInterface_VK::CreateSwapchainFrameBuffers() noexcept
 	Create_DepthStencilImage();
 	Create_DepthStencilImageViews();
 
+	const auto Create_ColorImage = [this]()
+	{
+		VkImageCreateInfo info = {};
+
+		info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+		info.imageType = VK_IMAGE_TYPE_2D;
+		info.format = m_swapchain_format.format;
+		info.extent = {static_cast<uint32_t>(m_width), static_cast<uint32_t>(m_height), 1};
+		info.mipLevels = 1;
+		info.arrayLayers = 1;
+		info.samples = m_msaa_samples;
+		info.tiling = VK_IMAGE_TILING_OPTIMAL;
+		info.usage = VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+
+		VmaAllocation p_allocation = {};
+		VkImage p_image = {};
+
+		VmaAllocationCreateInfo info_alloc = {};
+		auto p_commentary = "our color image";
+
+		info_alloc.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+		info_alloc.flags = VMA_ALLOCATION_CREATE_USER_DATA_COPY_STRING_BIT;
+		info_alloc.pUserData = const_cast<char*>(p_commentary);
+
+		VkResult status = vmaCreateImage(m_p_allocator, &info, &info_alloc, &p_image, &p_allocation, nullptr);
+
+		RMLUI_VK_ASSERTMSG(status == VkResult::VK_SUCCESS, "failed to vmaCreateImage");
+
+		m_texture_color.m_p_vk_image = p_image;
+		m_texture_color.m_p_vma_allocation = p_allocation;
+	};
+	Create_ColorImage();
+
+	const auto Create_ColorImageViews = [this]()
+	{
+		VkImageViewCreateInfo info = {};
+
+		info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+		info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+		info.image = m_texture_color.m_p_vk_image;
+		info.format = m_swapchain_format.format;
+		info.subresourceRange.baseMipLevel = 0;
+		info.subresourceRange.levelCount = 1;
+		info.subresourceRange.baseArrayLayer = 0;
+		info.subresourceRange.layerCount = 1;
+		info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+
+		VkImageView p_image_view = {};
+
+		VkResult status = vkCreateImageView(m_p_device, &info, nullptr, &p_image_view);
+
+		RMLUI_VK_ASSERTMSG(status == VkResult::VK_SUCCESS, "failed to vkCreateImageView");
+
+		m_texture_color.m_p_vk_image_view = p_image_view;
+	};
+	Create_ColorImageViews();
+
 	m_swapchain_frame_buffers.resize(m_swapchain_image_views.size());
 
-	Rml::Array<VkImageView, 2> attachments;
+	Rml::Array<VkImageView, 3> attachments;
 
 	VkFramebufferCreateInfo info = {};
 	info.sType = VkStructureType::VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
@@ -2204,11 +2298,13 @@ void RenderInterface_VK::CreateSwapchainFrameBuffers() noexcept
 	int index = 0;
 	VkResult status = VkResult::VK_SUCCESS;
 
+	attachments[0] = m_texture_color.m_p_vk_image_view;
+
 	attachments[1] = m_texture_depthstencil.m_p_vk_image_view;
 
 	for (auto p_view : m_swapchain_image_views)
 	{
-		attachments[0] = p_view;
+		attachments[2] = p_view;
 
 		status = vkCreateFramebuffer(m_p_device, &info, nullptr, &m_swapchain_frame_buffers[index]);
 
@@ -2284,7 +2380,7 @@ void RenderInterface_VK::Create_DepthStencilImage() noexcept
 	info.extent = {static_cast<uint32_t>(m_width), static_cast<uint32_t>(m_height), 1};
 	info.mipLevels = 1;
 	info.arrayLayers = 1;
-	info.samples = VK_SAMPLE_COUNT_1_BIT;
+	info.samples = m_msaa_samples;
 	info.tiling = VK_IMAGE_TILING_OPTIMAL;
 	info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
 
@@ -2478,6 +2574,10 @@ void RenderInterface_VK::DestroySwapchainFrameBuffers() noexcept
 	m_texture_depthstencil.m_p_vk_image = nullptr;
 	m_texture_depthstencil.m_p_vk_image_view = nullptr;
 
+	Destroy_Texture( m_texture_color );
+	m_texture_color.m_p_vk_image = nullptr;
+	m_texture_color.m_p_vk_image_view = nullptr;
+
 	for (auto p_frame_buffer : m_swapchain_frame_buffers)
 	{
 		vkDestroyFramebuffer(m_p_device, p_frame_buffer, nullptr);
@@ -2522,19 +2622,19 @@ void RenderInterface_VK::CreateRenderPass() noexcept
 {
 	RMLUI_VK_ASSERTMSG(m_p_device, "you must have a valid VkDevice here");
 
-	Rml::Array<VkAttachmentDescription, 2> attachments = {};
+	Rml::Array<VkAttachmentDescription, 3> attachments = {};
 
 	attachments[0].format = m_swapchain_format.format;
-	attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
+	attachments[0].samples = m_msaa_samples;
 	attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
 	attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
 	attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
 	attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
 	attachments[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-	attachments[0].finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+	attachments[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
 	attachments[1].format = Get_SupportedDepthFormat();
-	attachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
+	attachments[1].samples = m_msaa_samples;
 	attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
 	attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
 	attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
@@ -2542,10 +2642,19 @@ void RenderInterface_VK::CreateRenderPass() noexcept
 	attachments[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 	attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
+	attachments[2].format = m_swapchain_format.format;
+	attachments[2].samples = VK_SAMPLE_COUNT_1_BIT;
+	attachments[2].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	attachments[2].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+	attachments[2].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	attachments[2].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	attachments[2].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	attachments[2].finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
 	RMLUI_VK_ASSERTMSG(attachments[1].format != VkFormat::VK_FORMAT_UNDEFINED,
 		"can't obtain depth format, your device doesn't support depth/stencil operations");
 
-	Rml::Array<VkAttachmentReference, 2> color_references;
+	Rml::Array<VkAttachmentReference, 3> color_references;
 
 	// swapchain
 	color_references[0].attachment = 0;
@@ -2555,6 +2664,10 @@ void RenderInterface_VK::CreateRenderPass() noexcept
 	color_references[1].attachment = 1;
 	color_references[1].layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
+	// color resolve
+	color_references[2].attachment = 2;
+	color_references[2].layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
 	VkSubpassDescription subpass = {};
 
 	subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
@@ -2563,7 +2676,7 @@ void RenderInterface_VK::CreateRenderPass() noexcept
 	subpass.pInputAttachments = nullptr;
 	subpass.colorAttachmentCount = 1;
 	subpass.pColorAttachments = &color_references[0];
-	subpass.pResolveAttachments = nullptr;
+	subpass.pResolveAttachments = &color_references[2];
 	subpass.pDepthStencilAttachment = &color_references[1];
 	subpass.preserveAttachmentCount = 0;
 	subpass.pPreserveAttachments = nullptr;
